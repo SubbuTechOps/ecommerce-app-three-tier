@@ -55,145 +55,91 @@ pipeline {
        }
 
          stage('Configure Kubernetes') {
-             steps {
-                 withAWS(credentials: 'aws-access', region: env.AWS_DEFAULT_REGION) {
-                     script {
-                         sh '''
-                             aws eks update-kubeconfig --name demo-eks-cluster --region ${AWS_DEFAULT_REGION}
-                             
-                             # Create namespace if it doesn't exist
-                             kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
-         
-                             # Verify EBS CSI driver is installed
-                             if ! kubectl get pods -n kube-system | grep -q 'ebs-csi-controller'; then
-                                 echo "EBS CSI driver not found. Installing..."
-                                 eksctl create addon --name aws-ebs-csi-driver --cluster demo-eks-cluster --force
-                             else
-                                 echo "EBS CSI driver is already installed"
-                             fi
-         
-                             # Create storage class if it doesn't exist
-                             if ! kubectl get storageclass ebs-sc &> /dev/null; then
-                                 cat << 'EOFSC' | kubectl apply -f -
-         apiVersion: storage.k8s.io/v1
-         kind: StorageClass
-         metadata:
-           name: ebs-sc
-         provisioner: ebs.csi.aws.com
-         volumeBindingMode: WaitForFirstConsumer
-         parameters:
-           type: gp3
-           encrypted: "true"
-         EOFSC
-                             else
-                                 echo "Storage class ebs-sc already exists"
-                             fi
-                         '''
-                     }
-                 }
-             }
-         }
-
-       stage('Deploy MySQL') {
            steps {
                withAWS(credentials: 'aws-access', region: env.AWS_DEFAULT_REGION) {
-                   script {
-                       // Clean up any existing MySQL resources
-                       sh """
-                           kubectl delete service -n ${NAMESPACE} ecommerce-mysql-mysql --ignore-not-found=true
-                           kubectl delete sts -n ${NAMESPACE} ecommerce-mysql-mysql --ignore-not-found=true
-                           kubectl delete pvc -n ${NAMESPACE} -l app=ecommerce-db --ignore-not-found=true
-                           
-                           # Wait for resources to be deleted
-                           sleep 10
-                       """
-
-                       // Deploy MySQL
-                       sh """
-                           helm upgrade --install ecommerce-mysql ./helm/ecommerce-app \
-                               --namespace ${NAMESPACE} \
-                               --set backend.enabled=false \
-                               --set mysql.enabled=true \
-                               --set mysql.storageClassName=ebs-sc \
-                               --wait \
-                               --timeout 5m \
-                               --force
-
-                           # Wait for MySQL to be ready with improved error handling
-                           TIMEOUT=300
-                           start_time=\$(date +%s)
-                           while true; do
-                               if kubectl wait --namespace ${NAMESPACE} --for=condition=ready pod -l app=ecommerce-db --timeout=30s; then
-                                   echo "MySQL is ready"
-                                   break
-                               fi
-                               
-                               current_time=\$(date +%s)
-                               elapsed_time=\$((current_time - start_time))
-                               
-                               if [ \$elapsed_time -ge \$TIMEOUT ]; then
-                                   echo "Timeout waiting for MySQL to be ready"
-                                   kubectl describe pods -n ${NAMESPACE} -l app=ecommerce-db
-                                   exit 1
-                               fi
-                               
-                               echo "Waiting for MySQL to be ready..."
-                               sleep 10
-                           done
-                       """
-                   }
+                   sh '''
+                       aws eks update-kubeconfig --name demo-eks-cluster --region $AWS_DEFAULT_REGION
+                       kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+                   '''
+                   
+                   // Check and create storage class if needed
+                   sh '''#!/bin/bash
+                       if ! kubectl get storageclass ebs-sc &> /dev/null; then
+                           cat <<EOF | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-sc
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  type: gp3
+  encrypted: "true"
+EOF
+                       else
+                           echo "Storage class ebs-sc already exists"
+                       fi
+                   '''
                }
            }
        }
 
-       // Rest of the stages remain the same...
+       stage('Deploy MySQL') {
+           steps {
+               withAWS(credentials: 'aws-access', region: env.AWS_DEFAULT_REGION) {
+                   sh '''#!/bin/bash
+                       # Clean up existing resources
+                       kubectl delete pvc --namespace $NAMESPACE -l app=ecommerce-db --ignore-not-found=true
+                       kubectl delete service,sts --namespace $NAMESPACE -l app=ecommerce-db --ignore-not-found=true
+                       sleep 10
+                       
+                       # Deploy MySQL
+                       helm upgrade --install ecommerce-mysql ./helm/ecommerce-app \
+                           --namespace $NAMESPACE \
+                           --set backend.enabled=false \
+                           --set mysql.enabled=true \
+                           --set mysql.storageClassName=ebs-sc \
+                           --force \
+                           --wait \
+                           --timeout 5m
+
+                       # Wait for MySQL to be ready
+                       kubectl wait --namespace $NAMESPACE \
+                           --for=condition=ready pod \
+                           -l app=ecommerce-db \
+                           --timeout=300s
+                   '''
+               }
+           }
+       }
+
        stage('Deploy Backend') {
            steps {
                withAWS(credentials: 'aws-access', region: env.AWS_DEFAULT_REGION) {
-                   script {
-                       // Clean up old backend deployments
-                       sh """
-                           kubectl delete deployment -n ${NAMESPACE} -l app=ecommerce-backend --ignore-not-found=true
-                           kubectl wait --for=delete deployment -n ${NAMESPACE} -l app=ecommerce-backend --timeout=60s || true
-                       """
+                   sh '''#!/bin/bash
+                       # Clean up old backend
+                       kubectl delete --namespace $NAMESPACE deployment,service -l app=ecommerce-backend --ignore-not-found=true
+                       sleep 10
+                       
+                       # Deploy new backend
+                       helm upgrade --install ecommerce-backend ./helm/ecommerce-app \
+                           --namespace $NAMESPACE \
+                           --set mysql.enabled=false \
+                           --set backend.enabled=true \
+                           --set backend.image.repository=${REPOSITORY_URI} \
+                           --set backend.image.tag=backend-${IMAGE_TAG} \
+                           --set backend.env.FLASK_APP=wsgi:app \
+                           --set backend.env.FRONTEND_PATH=/app/frontend \
+                           --force \
+                           --wait \
+                           --timeout 5m
 
-                       // Deploy new backend
-                       sh """
-                           helm upgrade --install ecommerce-backend ./helm/ecommerce-app \
-                               --namespace ${NAMESPACE} \
-                               --set mysql.enabled=false \
-                               --set backend.enabled=true \
-                               --set backend.image.repository=${REPOSITORY_URI} \
-                               --set backend.image.tag=backend-${IMAGE_TAG} \
-                               --set backend.env.FLASK_APP=wsgi:app \
-                               --set backend.env.FRONTEND_PATH=/app/frontend \
-                               --wait \
-                               --timeout 5m \
-                               --force
-
-                           # Verify backend deployment with improved error handling
-                           TIMEOUT=300
-                           start_time=\$(date +%s)
-                           while true; do
-                               if kubectl wait --namespace ${NAMESPACE} --for=condition=ready pod -l app=ecommerce-backend --timeout=30s; then
-                                   echo "Backend is ready"
-                                   break
-                               fi
-                               
-                               current_time=\$(date +%s)
-                               elapsed_time=\$((current_time - start_time))
-                               
-                               if [ \$elapsed_time -ge \$TIMEOUT ]; then
-                                   echo "Timeout waiting for backend to be ready"
-                                   kubectl describe pods -n ${NAMESPACE} -l app=ecommerce-backend
-                                   exit 1
-                               fi
-                               
-                               echo "Waiting for backend to be ready..."
-                               sleep 10
-                           done
-                       """
-                   }
+                       # Wait for backend to be ready
+                       kubectl wait --namespace $NAMESPACE \
+                           --for=condition=ready pod \
+                           -l app=ecommerce-backend \
+                           --timeout=300s
+                   '''
                }
            }
        }
@@ -201,24 +147,14 @@ pipeline {
        stage('Verify Deployment') {
            steps {
                withAWS(credentials: 'aws-access', region: env.AWS_DEFAULT_REGION) {
-                   script {
-                       sh """
-                           echo "=== Final Deployment Status ==="
-                           kubectl get pods,svc,deploy,sts -n ${NAMESPACE}
-                           
-                           # Get the LoadBalancer URL and verify it's available
-                           echo "Application URL:"
-                           for i in {1..12}; do
-                               LB_HOSTNAME=\$(kubectl get svc -n ${NAMESPACE} ecommerce-backend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-                               if [ ! -z "\$LB_HOSTNAME" ]; then
-                                   echo "\$LB_HOSTNAME"
-                                   break
-                               fi
-                               echo "Waiting for LoadBalancer hostname..."
-                               sleep 10
-                           done
-                       """
-                   }
+                   sh '''#!/bin/bash
+                       echo "=== Final Deployment Status ==="
+                       kubectl get pods,svc,deploy,sts -n $NAMESPACE
+                       echo
+                       echo "Application URL:"
+                       kubectl get svc -n $NAMESPACE ecommerce-backend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+                       echo
+                   '''
                }
            }
        }
@@ -226,37 +162,33 @@ pipeline {
 
    post {
        always {
-           script {
-               sh """
-                   docker compose -f docker/docker-compose.yaml down || true
-                   docker rmi ${REPOSITORY_URI}:backend-${IMAGE_TAG} || true
-                   docker rmi ecommerce-app-backend:${IMAGE_TAG} || true
-               """
-           }
+           sh '''
+               docker compose -f docker/docker-compose.yaml down || true
+               docker rmi ${REPOSITORY_URI}:backend-${IMAGE_TAG} || true
+               docker rmi ecommerce-app-backend:${IMAGE_TAG} || true
+           '''
        }
        success {
            echo "Deployment successful!"
        }
        failure {
-           script {
-               withAWS(credentials: 'aws-access', region: env.AWS_DEFAULT_REGION) {
-                   sh """
-                       echo "=== Deployment Debug Info ==="
-                       kubectl get pods,svc,deploy,sts -n ${NAMESPACE}
-                       echo "=== Storage Classes ==="
-                       kubectl get storageclass
-                       echo "=== PVC Status ==="
-                       kubectl get pvc -n ${NAMESPACE}
-                       echo "=== MySQL Pod Description ==="
-                       kubectl describe pod -n ${NAMESPACE} -l app=ecommerce-db || true
-                       echo "=== MySQL Logs ==="
-                       kubectl logs -n ${NAMESPACE} -l app=ecommerce-db --tail=100 || true
-                       echo "=== Backend Pod Description ==="
-                       kubectl describe pod -n ${NAMESPACE} -l app=ecommerce-backend || true
-                       echo "=== Backend Logs ==="
-                       kubectl logs -n ${NAMESPACE} -l app=ecommerce-backend --tail=100 || true
-                   """
-               }
+           withAWS(credentials: 'aws-access', region: env.AWS_DEFAULT_REGION) {
+               sh '''#!/bin/bash
+                   echo "=== Deployment Debug Info ==="
+                   kubectl get pods,svc,deploy,sts -n $NAMESPACE
+                   echo "=== Storage Classes ==="
+                   kubectl get storageclass
+                   echo "=== PVC Status ==="
+                   kubectl get pvc -n $NAMESPACE
+                   echo "=== MySQL Pod Description ==="
+                   kubectl describe pod -n $NAMESPACE -l app=ecommerce-db || true
+                   echo "=== MySQL Logs ==="
+                   kubectl logs -n $NAMESPACE -l app=ecommerce-db --tail=100 || true
+                   echo "=== Backend Pod Description ==="
+                   kubectl describe pod -n $NAMESPACE -l app=ecommerce-backend || true
+                   echo "=== Backend Logs ==="
+                   kubectl logs -n $NAMESPACE -l app=ecommerce-backend --tail=100 || true
+               '''
            }
            echo 'Deployment failed!'
        }
