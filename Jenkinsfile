@@ -54,41 +54,45 @@ pipeline {
            }
        }
 
-       stage('Configure Kubernetes') {
-           steps {
-               withAWS(credentials: 'aws-access', region: env.AWS_DEFAULT_REGION) {
-                   script {
-                       sh """
-                           aws eks update-kubeconfig --name demo-eks-cluster --region ${AWS_DEFAULT_REGION}
-                           
-                           # Create namespace if it doesn't exist
-                           kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
-
-                           # Verify EBS CSI driver is installed
-                           if ! kubectl get pods -n kube-system | grep -q 'ebs-csi-controller'; then
-                               echo "EBS CSI driver not found. Installing..."
-                               eksctl create addon --name aws-ebs-csi-driver --cluster demo-eks-cluster --force
-                           fi
-
-                           # Create storage class if it doesn't exist
-                           if ! kubectl get storageclass ebs-sc &> /dev/null; then
-                               cat << EOF | kubectl apply -f -
-                               apiVersion: storage.k8s.io/v1
-                               kind: StorageClass
-                               metadata:
-                                 name: ebs-sc
-                               provisioner: ebs.csi.aws.com
-                               volumeBindingMode: WaitForFirstConsumer
-                               parameters:
-                                 type: gp3
-                                 encrypted: "true"
-                               EOF
-                           fi
-                       """
-                   }
-               }
-           }
-       }
+         stage('Configure Kubernetes') {
+             steps {
+                 withAWS(credentials: 'aws-access', region: env.AWS_DEFAULT_REGION) {
+                     script {
+                         sh '''
+                             aws eks update-kubeconfig --name demo-eks-cluster --region ${AWS_DEFAULT_REGION}
+                             
+                             # Create namespace if it doesn't exist
+                             kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+         
+                             # Verify EBS CSI driver is installed
+                             if ! kubectl get pods -n kube-system | grep -q 'ebs-csi-controller'; then
+                                 echo "EBS CSI driver not found. Installing..."
+                                 eksctl create addon --name aws-ebs-csi-driver --cluster demo-eks-cluster --force
+                             else
+                                 echo "EBS CSI driver is already installed"
+                             fi
+         
+                             # Create storage class if it doesn't exist
+                             if ! kubectl get storageclass ebs-sc &> /dev/null; then
+                                 cat << 'EOFSC' | kubectl apply -f -
+         apiVersion: storage.k8s.io/v1
+         kind: StorageClass
+         metadata:
+           name: ebs-sc
+         provisioner: ebs.csi.aws.com
+         volumeBindingMode: WaitForFirstConsumer
+         parameters:
+           type: gp3
+           encrypted: "true"
+         EOFSC
+                             else
+                                 echo "Storage class ebs-sc already exists"
+                             fi
+                         '''
+                     }
+                 }
+             }
+         }
 
        stage('Deploy MySQL') {
            steps {
