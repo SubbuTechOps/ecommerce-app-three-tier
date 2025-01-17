@@ -84,7 +84,7 @@ EOF
            }
        }
 
-stage('Deploy MySQL') {
+   stage('Deploy MySQL') {
     steps {
         withAWS(credentials: 'aws-access', region: env.AWS_DEFAULT_REGION) {
             sh '''#!/bin/bash
@@ -92,8 +92,12 @@ stage('Deploy MySQL') {
                 kubectl delete pvc,sts,svc --namespace $NAMESPACE -l app=ecommerce-db --ignore-not-found=true
                 sleep 20
 
-                # Create PVC manually first with proper heredoc syntax
-                cat <<'EOF' | kubectl apply -f -
+                # Get the list of nodes
+                node_name=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+                echo "Using node: $node_name"
+
+                # Create PVC with node affinity
+                cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -110,11 +114,16 @@ spec:
       storage: 10Gi
 EOF
 
-                # Wait for PVC to be created
-                echo "Waiting for PVC to be created..."
-                sleep 10
+                # Create a temporary patch for the StatefulSet
+                cat <<EOF > mysql-sts-patch.yaml
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: $node_name
+EOF
 
-                # Deploy MySQL with increased timeout
+                # Deploy MySQL with patched configuration
                 helm upgrade --install ecommerce-mysql ./helm/ecommerce-app \
                     --namespace $NAMESPACE \
                     --set backend.enabled=false \
@@ -127,13 +136,17 @@ EOF
                     --timeout 10m \
                     --force
 
-                # Wait for MySQL pod
+                # Patch the StatefulSet to add node selector
+                kubectl patch statefulset ecommerce-mysql-mysql -n $NAMESPACE --patch-file mysql-sts-patch.yaml
+
+                # Wait for MySQL pod with increased timeout
                 echo "Waiting for MySQL pod..."
-                TIMEOUT=300
+                TIMEOUT=600
                 start_time=$(date +%s)
 
                 while true; do
-                    if kubectl -n $NAMESPACE get pod -l app=ecommerce-db -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q "Running"; then
+                    pod_status=$(kubectl -n $NAMESPACE get pod -l app=ecommerce-db -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
+                    if [[ "$pod_status" == "Running" ]]; then
                         echo "MySQL pod is running"
                         break
                     fi
@@ -144,12 +157,20 @@ EOF
                     if [ $elapsed_time -ge $TIMEOUT ]; then
                         echo "Timeout waiting for MySQL pod"
                         kubectl describe pod -n $NAMESPACE -l app=ecommerce-db
+                        kubectl describe pvc -n $NAMESPACE -l app=ecommerce-db
                         exit 1
                     fi
 
-                    echo "Waiting... ($elapsed_time seconds elapsed)"
+                    echo "Waiting... ($elapsed_time seconds elapsed), current status: $pod_status"
                     sleep 10
                 done
+
+                # Wait for MySQL to be ready
+                echo "Waiting for MySQL to be fully ready..."
+                kubectl wait --namespace $NAMESPACE \
+                    --for=condition=ready pod \
+                    -l app=ecommerce-db \
+                    --timeout=300s
             '''
         }
     }
