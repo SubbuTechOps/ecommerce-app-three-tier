@@ -84,35 +84,86 @@ EOF
            }
        }
 
-       stage('Deploy MySQL') {
-           steps {
-               withAWS(credentials: 'aws-access', region: env.AWS_DEFAULT_REGION) {
-                   sh '''#!/bin/bash
-                       # Clean up existing resources
-                       kubectl delete pvc --namespace $NAMESPACE -l app=ecommerce-db --ignore-not-found=true
-                       kubectl delete service,sts --namespace $NAMESPACE -l app=ecommerce-db --ignore-not-found=true
-                       sleep 10
-                       
-                       # Deploy MySQL
-                       helm upgrade --install ecommerce-mysql ./helm/ecommerce-app \
-                           --namespace $NAMESPACE \
-                           --set backend.enabled=false \
-                           --set mysql.enabled=true \
-                           --set mysql.storageClassName=ebs-sc \
-                           --force \
-                           --wait \
-                           --timeout 5m
-
-                       # Wait for MySQL to be ready
-                       kubectl wait --namespace $NAMESPACE \
-                           --for=condition=ready pod \
-                           -l app=ecommerce-db \
-                           --timeout=300s
-                   '''
-               }
-           }
-       }
-
+         stage('Deploy MySQL') {
+             steps {
+                 withAWS(credentials: 'aws-access', region: env.AWS_DEFAULT_REGION) {
+                     sh '''#!/bin/bash
+                         # Clean up existing resources
+                         kubectl delete pvc,sts,svc --namespace $NAMESPACE -l app=ecommerce-db --ignore-not-found=true
+                         sleep 20  # Increased sleep time to ensure cleanup completes
+         
+                         # Create PVC manually first
+                         cat <<EOF | kubectl apply -f -
+         apiVersion: v1
+         kind: PersistentVolumeClaim
+         metadata:
+           name: mysql-persistent-storage-ecommerce-mysql-mysql-0
+           namespace: $NAMESPACE
+           labels:
+             app: ecommerce-db
+         spec:
+           accessModes:
+             - ReadWriteOnce
+           storageClassName: ebs-sc
+           resources:
+             requests:
+               storage: 10Gi
+         EOF
+         
+                         # Wait for PVC to be bound
+                         echo "Waiting for PVC to be bound..."
+                         for i in $(seq 1 30); do
+                             if kubectl get pvc -n $NAMESPACE mysql-persistent-storage-ecommerce-mysql-mysql-0 -o jsonpath='{.status.phase}' | grep -q "Bound"; then
+                                 echo "PVC is bound"
+                                 break
+                             fi
+                             if [ $i -eq 30 ]; then
+                                 echo "Timeout waiting for PVC to be bound"
+                                 exit 1
+                             fi
+                             echo "Waiting... Attempt $i/30"
+                             sleep 10
+                         done
+         
+                         # Deploy MySQL with increased timeout
+                         helm upgrade --install ecommerce-mysql ./helm/ecommerce-app \
+                             --namespace $NAMESPACE \
+                             --set backend.enabled=false \
+                             --set mysql.enabled=true \
+                             --set mysql.storageClassName=ebs-sc \
+                             --set mysql.persistence.size=10Gi \
+                             --set mysql.resources.requests.memory=512Mi \
+                             --set mysql.resources.limits.memory=1Gi \
+                             --wait \
+                             --timeout 10m \
+                             --force
+         
+                         # Wait for MySQL pod to be running
+                         echo "Waiting for MySQL pod to be running..."
+                         for i in $(seq 1 60); do
+                             if kubectl get pods -n $NAMESPACE -l app=ecommerce-db -o jsonpath='{.items[0].status.phase}' | grep -q "Running"; then
+                                 echo "MySQL pod is running"
+                                 break
+                             fi
+                             if [ $i -eq 60 ]; then
+                                 echo "Timeout waiting for MySQL pod"
+                                 kubectl describe pod -n $NAMESPACE -l app=ecommerce-db
+                                 exit 1
+                             fi
+                             echo "Waiting... Attempt $i/60"
+                             sleep 10
+                         done
+         
+                         # Final check for MySQL readiness
+                         kubectl wait --namespace $NAMESPACE \
+                             --for=condition=ready pod \
+                             -l app=ecommerce-db \
+                             --timeout=300s
+                     '''
+                 }
+             }
+         }
+       
        stage('Deploy Backend') {
            steps {
                withAWS(credentials: 'aws-access', region: env.AWS_DEFAULT_REGION) {
